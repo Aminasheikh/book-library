@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google";
 import { Toaster } from "sonner";
+import { SupabaseSync } from "@/components/SupabaseSync";
 import "./globals.css";
 
 const jakarta = Plus_Jakarta_Sans({
@@ -29,6 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en" className={jakarta.variable}>
       <body className="font-sans antialiased">
         <div className="aurora-bg" aria-hidden="true" />
+        <SupabaseSync />
         {children}
         <Toaster
           position="bottom-right"

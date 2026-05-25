@@ -2,14 +2,33 @@
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import { toast } from "sonner";
 import type { Book, BorrowRecord, Category } from "@/lib/types";
 import { seedBooks, seedCategories, seedBorrows } from "@/lib/seed";
+import {
+  isSupabaseConfigured,
+  fetchBooks,
+  fetchCategories,
+  fetchBorrows,
+  insertBook,
+  insertCategory,
+  insertBorrow,
+  updateBookRemote,
+  updateCategoryRemote,
+  markReturnedRemote,
+  deleteBookRemote,
+  deleteCategoryRemote,
+  deleteBorrowRemote,
+} from "@/lib/supabase/repo";
 
 /* ----------------------------------------------------------------
-   Local Zustand store — backs the UI when Supabase isn't configured.
-   When Supabase IS configured, the same actions can be swapped for
-   remote calls (see hooks/useBooks.ts). For the submission demo this
-   gives a fully working app with no setup required.
+   Zustand store — single source of truth for the UI.
+
+   When Supabase is configured (NEXT_PUBLIC_DEMO_MODE=false + credentials),
+   the store hydrates from Supabase on mount and every mutation is mirrored
+   to Supabase in the background (optimistic UI).
+
+   When NOT configured, the store uses LocalStorage persistence with seed data.
    ---------------------------------------------------------------- */
 
 type State = {
@@ -17,6 +36,7 @@ type State = {
   categories: Category[];
   borrows: BorrowRecord[];
   hydrated: boolean;
+  syncing: boolean;
 
   // book actions
   addBook: (b: Omit<Book, "id" | "added_at" | "updated_at">) => Book;
@@ -33,54 +53,85 @@ type State = {
   returnBook: (recordId: string) => void;
   deleteBorrow: (recordId: string) => void;
 
+  // sync
+  syncFromRemote: () => Promise<void>;
   reset: () => void;
 };
 
 const uid = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
-    : `id_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** Background fire-and-forget — never block the UI. */
+function bg(fn: () => Promise<void>, ctx: string) {
+  fn().catch((err) => {
+    console.error(`[supabase:${ctx}]`, err);
+    toast.error(`Couldn't sync ${ctx} to cloud`, {
+      description: err?.message ?? "Check your connection.",
+    });
+  });
+}
+
+const initialBooks = isSupabaseConfigured ? [] : seedBooks;
+const initialCategories = isSupabaseConfigured ? [] : seedCategories;
+const initialBorrows = isSupabaseConfigured ? [] : seedBorrows;
 
 export const useLibrary = create<State>()(
   persist(
     (set, get) => ({
-      books: seedBooks,
-      categories: seedCategories,
-      borrows: seedBorrows,
+      books: initialBooks,
+      categories: initialCategories,
+      borrows: initialBorrows,
       hydrated: false,
+      syncing: false,
 
       addBook: (b) => {
         const now = new Date().toISOString();
         const book: Book = { ...b, id: uid(), added_at: now, updated_at: now };
         set((s) => ({ books: [book, ...s.books] }));
+        if (isSupabaseConfigured) bg(() => insertBook(book), "new book");
         return book;
       },
-      updateBook: (id, patch) =>
+
+      updateBook: (id, patch) => {
         set((s) => ({
           books: s.books.map((b) =>
             b.id === id ? { ...b, ...patch, updated_at: new Date().toISOString() } : b,
           ),
-        })),
-      deleteBook: (id) =>
+        }));
+        if (isSupabaseConfigured) bg(() => updateBookRemote(id, patch), "book update");
+      },
+
+      deleteBook: (id) => {
         set((s) => ({
           books: s.books.filter((b) => b.id !== id),
           borrows: s.borrows.filter((r) => r.book_id !== id),
-        })),
+        }));
+        if (isSupabaseConfigured) bg(() => deleteBookRemote(id), "book deletion");
+      },
 
       addCategory: (c) => {
         const cat: Category = { ...c, id: uid(), created_at: new Date().toISOString() };
         set((s) => ({ categories: [...s.categories, cat] }));
+        if (isSupabaseConfigured) bg(() => insertCategory(cat), "new category");
         return cat;
       },
-      updateCategory: (id, patch) =>
+
+      updateCategory: (id, patch) => {
         set((s) => ({
           categories: s.categories.map((c) => (c.id === id ? { ...c, ...patch } : c)),
-        })),
-      deleteCategory: (id) =>
+        }));
+        if (isSupabaseConfigured) bg(() => updateCategoryRemote(id, patch), "category update");
+      },
+
+      deleteCategory: (id) => {
         set((s) => ({
           categories: s.categories.filter((c) => c.id !== id),
           books: s.books.map((b) => (b.category_id === id ? { ...b, category_id: null } : b)),
-        })),
+        }));
+        if (isSupabaseConfigured) bg(() => deleteCategoryRemote(id), "category deletion");
+      },
 
       lendBook: (b) => {
         const rec: BorrowRecord = {
@@ -95,33 +146,71 @@ export const useLibrary = create<State>()(
             book.id === b.book_id ? { ...book, status: "lent" } : book,
           ),
         }));
+        if (isSupabaseConfigured) {
+          bg(() => insertBorrow(rec), "lending record");
+          bg(() => updateBookRemote(b.book_id, { status: "lent" }), "book status");
+        }
         return rec;
       },
-      returnBook: (recordId) =>
-        set((s) => {
-          const rec = s.borrows.find((r) => r.id === recordId);
-          return {
-            borrows: s.borrows.map((r) =>
-              r.id === recordId ? { ...r, returned_at: new Date().toISOString() } : r,
-            ),
-            books: rec
-              ? s.books.map((b) =>
-                  b.id === rec.book_id
-                    ? { ...b, status: b.progress >= 100 ? "completed" : "reading" }
-                    : b,
-                )
-              : s.books,
-          };
-        }),
-      deleteBorrow: (recordId) =>
-        set((s) => ({ borrows: s.borrows.filter((r) => r.id !== recordId) })),
+
+      returnBook: (recordId) => {
+        const now = new Date().toISOString();
+        const rec = get().borrows.find((r) => r.id === recordId);
+        set((s) => ({
+          borrows: s.borrows.map((r) =>
+            r.id === recordId ? { ...r, returned_at: now } : r,
+          ),
+          books: rec
+            ? s.books.map((b) =>
+                b.id === rec.book_id
+                  ? { ...b, status: b.progress >= 100 ? "completed" : "reading" }
+                  : b,
+              )
+            : s.books,
+        }));
+        if (isSupabaseConfigured && rec) {
+          bg(() => markReturnedRemote(recordId, now), "return");
+          const book = get().books.find((b) => b.id === rec.book_id);
+          if (book) bg(() => updateBookRemote(book.id, { status: book.status }), "book status");
+        }
+      },
+
+      deleteBorrow: (recordId) => {
+        set((s) => ({ borrows: s.borrows.filter((r) => r.id !== recordId) }));
+        if (isSupabaseConfigured) bg(() => deleteBorrowRemote(recordId), "borrow deletion");
+      },
+
+      syncFromRemote: async () => {
+        if (!isSupabaseConfigured) return;
+        if (get().syncing) return;
+        set({ syncing: true });
+        try {
+          const [books, categories, borrows] = await Promise.all([
+            fetchBooks(),
+            fetchCategories(),
+            fetchBorrows(),
+          ]);
+          set({ books, categories, borrows, syncing: false });
+        } catch (err) {
+          console.error("[supabase:sync]", err);
+          toast.error("Couldn't load from cloud", {
+            description: (err as Error)?.message ?? "Falling back to local data.",
+          });
+          set({ syncing: false });
+        }
+      },
 
       reset: () =>
-        set({ books: seedBooks, categories: seedCategories, borrows: seedBorrows }),
+        set({
+          books: seedBooks,
+          categories: seedCategories,
+          borrows: seedBorrows,
+        }),
     }),
     {
       name: "lumen-library-v1",
       storage: createJSONStorage(() => localStorage),
+      // Cache last-known state for instant load; SupabaseSync re-fetches fresh.
       onRehydrateStorage: () => (state) => {
         if (state) state.hydrated = true;
       },
